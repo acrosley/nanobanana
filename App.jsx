@@ -185,28 +185,121 @@ function App() {
     setSavedPrompts(prev => prev.filter(p => p.id !== id));
   }, []);
 
-  // Generate images (mock for demo)
+  const [error, setError] = useState('');
+
+  // Generate images using Gemini API
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim()) return;
+    if (!apiKey) {
+      setError('Please set your Gemini API key first');
+      setShowApiKeyInput(true);
+      return;
+    }
     
     setIsGenerating(true);
+    setError('');
     
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 2000));
-    
-    // Mock generated images
-    const mockImages = Array(settings.numberOfImages).fill(null).map((_, i) => ({
-      id: Date.now() + i,
-      url: `https://picsum.photos/seed/${Date.now() + i}/${settings.resolution === '1k' ? 512 : settings.resolution === '2k' ? 768 : 1024}`,
-      prompt: prompt,
-      settings: { ...settings },
-      cost: costEstimate.totalCost / settings.numberOfImages,
-      timestamp: new Date().toISOString()
-    }));
-    
-    setGeneratedImages(prev => [...mockImages, ...prev]);
-    setIsGenerating(false);
-  }, [prompt, settings, costEstimate]);
+    try {
+      // Build the full prompt with negative prompt if provided
+      let fullPrompt = prompt;
+      if (negativePrompt.trim()) {
+        fullPrompt += `\n\nAvoid: ${negativePrompt}`;
+      }
+
+      // Add aspect ratio instruction
+      const aspectInstructions = {
+        '1:1': 'Create a square image.',
+        '16:9': 'Create a wide landscape image with 16:9 aspect ratio.',
+        '9:16': 'Create a tall portrait image with 9:16 aspect ratio.',
+        '4:3': 'Create an image with 4:3 aspect ratio.',
+        '3:2': 'Create an image with 3:2 aspect ratio.'
+      };
+      fullPrompt = `${aspectInstructions[settings.aspectRatio]} ${fullPrompt}`;
+
+      // Prepare reference images if any
+      const parts = [];
+      
+      // Add reference images as inline data
+      for (const refImg of referenceImages) {
+        const base64Data = refImg.data.split(',')[1];
+        const mimeType = refImg.type || 'image/png';
+        parts.push({
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Data
+          }
+        });
+        parts.push({
+          text: `Use this reference image for ${refImg.mode}. Influence: ${Math.round(refImg.influence * 100)}%.`
+        });
+      }
+
+      // Add the main prompt
+      parts.push({
+        text: `Generate an image: ${fullPrompt}`
+      });
+
+      const generatedImagesResult = [];
+
+      // Generate the requested number of images
+      for (let i = 0; i < settings.numberOfImages; i++) {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              contents: [{
+                parts: parts
+              }],
+              generationConfig: {
+                responseModalities: ["TEXT", "IMAGE"],
+                temperature: settings.guidanceScale / 10,
+                ...(settings.seed ? { seed: parseInt(settings.seed) + i } : {})
+              }
+            })
+          }
+        );
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error?.message || `API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // Extract the generated image from the response
+        if (data.candidates && data.candidates[0]?.content?.parts) {
+          for (const part of data.candidates[0].content.parts) {
+            if (part.inlineData) {
+              const imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+              generatedImagesResult.push({
+                id: Date.now() + i + Math.random(),
+                url: imageUrl,
+                prompt: prompt,
+                settings: { ...settings },
+                cost: costEstimate.totalCost / settings.numberOfImages,
+                timestamp: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+
+      if (generatedImagesResult.length === 0) {
+        throw new Error('No images were generated. The model may not have returned an image. Try a different prompt.');
+      }
+
+      setGeneratedImages(prev => [...generatedImagesResult, ...prev]);
+    } catch (err) {
+      console.error('Generation error:', err);
+      setError(err.message || 'Failed to generate image. Please try again.');
+    } finally {
+      setIsGenerating(false);
+    }
+  }, [prompt, negativePrompt, settings, costEstimate, apiKey, referenceImages]);
 
   return (
     <div className={`min-h-screen transition-colors duration-300 ${darkMode ? 'bg-[#0a0a0f] text-gray-100' : 'bg-[#f8f7f4] text-gray-900'}`}>
@@ -510,6 +603,22 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {/* Error Display */}
+              {error && (
+                <div className={`rounded-xl p-4 border ${darkMode ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-red-50 border-red-200 text-red-600'}`}>
+                  <div className="flex items-start gap-3">
+                    <X className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="font-medium">Generation Failed</p>
+                      <p className="text-sm mt-1 opacity-80">{error}</p>
+                    </div>
+                    <button onClick={() => setError('')} className="p-1 hover:opacity-70 transition-opacity">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Generate Button */}
               <button
